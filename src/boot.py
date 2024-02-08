@@ -8,16 +8,27 @@ from machine import UART
 
 
 def normalize_resistance(resistance):
+    """
+    ask the nvs manager for the resistance data (or make that a global, not sure yet)
+    and use that to make a scaled resistance value
+    probably have to make a new func to generate the polynomials for smoothing this data
+    """
     pass
-    # make this use the nvs values eventually
 
 
 def calc_speed(power, resistances_array):
+    """
+    from power, back out the speed based on an coefficients in a resistance polynomial
+    probably store that as a global too
+    """
     pass
-    # from power, back out the speed based on an coefficients in a resistance polynomial
 
 
 def flip_le_ascii(s):
+    """
+    decode a bytestring as ascii, then reverse it and return it as an int
+    maybe there's a more efficient way to be unpacking the structs?
+    """
     r = ""
     for c in s.decode("ascii"):
         r = c + r
@@ -51,10 +62,16 @@ async def serial_mirror(buf, uartA, uartB, packetready_evt):
 
 
 async def nvs_manager():
-    pass
-    # 
+    """
+    stash values when asked by the packet parser, checking if they've changed
+    that would mean we're on a different peloton
+    """
 
 async def packet_parse(buf, packetready_evt):
+    """
+    honestly kind of the mainloop
+    responding to new serial packets is the main driver of most of the state changes here
+    """
     is_query = 0
     is_resp = 0
     
@@ -69,7 +86,7 @@ async def packet_parse(buf, packetready_evt):
     while True:
         await packetready_evt.wait()
         
-        # print(hexlify(buf[:2], "-"))
+        # print(hexlify(buf[:2], "-")) # show what packet header we're dealing with
         
         if buf[0] == 0xF1:
             if buf[1] == 0xFE:
@@ -121,6 +138,13 @@ async def packet_parse(buf, packetready_evt):
 
 
 async def main():
+    """
+    create some UARTs that get handed to the serial mirror
+    maybe I'll move these to globals, since that's how they're used
+    
+    also making an event to control the packet parser
+    ...that should probably also be a global
+    """
     buf = bytearray(20)
     head_uart = UART(1, baudrate=19200, tx=33, rx=26, timeout=5)
     bike_uart = UART(2, baudrate=19200, tx=32, rx=25, timeout=5)
