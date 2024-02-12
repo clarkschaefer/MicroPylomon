@@ -2,6 +2,7 @@
 fully sniff a Peloton Bike (original)'s level-shifted RS-232 and spit that data out as if we're a bike computer
 """
 
+import math
 import uasyncio as asyncio
 import aioble
 import bluetooth
@@ -13,16 +14,15 @@ from machine import UART, Pin
 from micropython import const
 from neopixel import NeoPixel
 
-# ===== BLUETOOTH =====
-
-# ----- SERVICES -----
+# ========== BLUETOOTH ==========
+# ---------- SERVICES ----------
 # cycling power service; needs notify/read/write
 _UUID_CYCLING_POWER_SERVICE = bluetooth.UUID(0x1818)
 # cycling speed and cadence service; needs notify/read/write
 _UUID_CYCLING_CADENCE_SPEED_SERVICE = bluetooth.UUID(0x1816)
 
 
-# ----- CHARACTERISTICS -----
+# ---------- CHARACTERISTICS ----------
 # cycling power feature characteristic, mandatory read
 _UUID_CYCLING_POWER_FEATURE = bluetooth.UUID(0x2A65)
 # cycling power feature characteristic cycling power feature field flags, we use these later to set other flags too
@@ -90,13 +90,13 @@ _UUID_CSC_MEASUREMENT = bluetooth.UUID(0x2A5B)
 _CSC_WHEEL_REVOLUTION_DATA_PRESENT = const(False and _CSC_WHEEL_REVOLUTION_DATA_SUPPORTED)
 _CSC_CRANK_REVOLUTION_DATA_PRESENT = const(False and _CSC_CRANK_REVOLUTION_DATA_SUPPORTED)
 
-# ----- OTHER STUFF -----
+# ---------- OTHER STUFF ----------
 # advertising interval
 _ADV_INTERVAL_MS = const(250000)
 # appearance
 _ADV_APPEARANCE_CYCLING_COMPUTER = const(0x0481)
-# ----- SETUP -----
-# aioble POWER service setup
+# ---------- SETUP ----------
+# aioble power service setup
 
 
 # ===== RGB LED STUFF =====
@@ -173,11 +173,11 @@ def _encode_csc_feature():
 def _encode_csc_measurement(raw_cadence, raw_power):
     """
     encode cadence and speed data as well as required feature information
-    """
+    """ # todo encode csc measurement from cadence and power
     pass
 
 
-def quickrgb(r,g,b): # TODO: make this an async task that manages light to indicate state
+def quickrgb(r,g,b): # todo make this an async task that manages light to indicate state
     global n
     n[0] = (r,g,b)
     n.write()
@@ -189,22 +189,52 @@ def normalize_resistance(resistance):
     and use that to make a scaled resistance value
     probably have to make a new func to generate the polynomials for smoothing this data
     """
-    pass
+    return resistance # todo make this do something using the nvs interface from the cal data
 
 
-def calc_speed(raw_power, resistances_array):
+def calc_speed(raw_power):
     """
-    from raw_power, back out the speed based on an coefficients in a resistance polynomial
-    probably store that as a global too
-    """
-    pass
+    from raw_power, use information from here to calculate a speed based on the below constants (all metric)
+    returns a value in km/h
+    """ # todo check if I should be preallocating all of this up above so I don't allocate a ton of stuff every time
+    power = raw_power / 10 # W, raw_power from bike is in deciwatts
+    
+    # all of this is constants so it can be optimized by the compiler, hopefully later too
+    Cd = const(0.62) # unitless, coefficient of drag
+    A = const(0.45) # m^2, frontal drag area
+    rho = const(1.225) # kg/m^3, density
+    Crr = const(0.006) # unitless, coefficient of rolling resistance
+    mass = const(100.7) # kg, mass of rider + gear + bike
+    loss = const(0.02) # % (sorta just /1), drivetrain loss
+    wind = const(0) # m/s, headwind speed
+    grade = const(0) # %, grade percent
+    grade_angle = math.atan(grade/100) # radians, grade angle
+    gravity = const(9.80665) # m/s^2, gravity
+    
+    # Cardano's method calculations
+    a = 0.5 * Cd * A * rho
+    b = wind * Cd * A * rho
+    c = mass * gravity * (math.sin(grade_angle) + Crr*math.cos(grade_angle)) + 0.5*Cd*A*rho*wind**2
+    d = (loss-1) * power
+    
+    Q = (3*a*c - b**2) / (9*a**2)
+    # todo figure out how to cache this, maybe store a table by default?
+    R = (9*a*b*c - 27*a**2*d - 2*b**3) / (54*a**3)
+    sqrtq3r2 = math.sqrt(Q**3 + R**2) # only do this once
+    S = (R + sqrtq3r2)**(1/3) # very expensive ;-;
+    T = (R - sqrtq3r2)**(1/3)
+    
+    speed = S + T - (b/(3*a)) # m/s, final speed
+    
+    # todo implement Imran Haque's more efficient speed decoder fitted to my generated power/speed data from the .xlsx
+    return speed * 3.6 # 3600 s/h / 1000 m/km
 
 
 def reverse_bytes_to_int(s):
     """
     decode a bytestring as ascii, then reverse it and return it as an int
     maybe there's a more efficient way to be unpacking the structs?
-    """
+    """ # todo find a better way to do this
     r = ""
     for c in s.decode("ascii"):
         r = c + r
@@ -212,24 +242,24 @@ def reverse_bytes_to_int(s):
     return int(r)
 
 
-async def serial_mirror_task(buf, uartA, uartB, packetready_evt):
+async def serial_mirror_task(buf, head_uart, bike_uart, packet_ready_evt):
     """
     takes a buffer, two UARTs, and a flag to set when it's read from either of them
     I suppose I could set events based on where the message came from,
     but I can already parse that out 
-    """
+    """ # todo don't send packets to the head unit if it's one we requested
     len = 0
     
     while True:
-        if uartA.any():
-            len = uartA.readinto(buf)
-            uartB.write(buf[:len])
-            packetready_evt.set()
+        if head_uart.any():
+            len = head_uart.readinto(buf)
+            bike_uart.write(buf[:len])
+            packet_ready_evt.set()
             
-        if uartB.any() and not packetready_evt.is_set(): # make sure we don't overwrite
-            len = uartB.readinto(buf)
-            uartA.write(buf[:len])
-            packetready_evt.set()
+        if bike_uart.any() and not packet_ready_evt.is_set(): # make sure we don't overwrite
+            len = bike_uart.readinto(buf)
+            head_uart.write(buf[:len])
+            packet_ready_evt.set()
             
         await asyncio.sleep_ms(0) # yield, but don't wait too long to check for the response packet
 
@@ -238,7 +268,8 @@ async def nvs_manager():
     """
     stash values when asked by the packet parser, checking if they've changed
     that would mean we're on a different peloton
-    """
+    """ # todo create system to store resistance values so we can use those for... something
+    pass
 
 async def bluetooth_task():
     """
@@ -251,6 +282,7 @@ async def bluetooth_task():
         power_service,
         _UUID_CYCLING_POWER_FEATURE,
         read=True)
+    global power_measurement_characteristic
     power_measurement_characteristic = aioble.Characteristic(
         power_service,
         _UUID_CYCLING_POWER_MEASUREMENT,
@@ -263,11 +295,15 @@ async def bluetooth_task():
         csc_service,
         _UUID_CSC_FEATURE,
         read=True)
+    global csc_measurement_characteristic
     csc_measurement_characteristic = aioble.Characteristic(
         csc_service,
         _UUID_CSC_MEASUREMENT,
         notify=True)
     
+    power_feature_characteristic.write(_encode_power_feature())
+    power_measurement_characteristic.write(_encode_power_measurement(0))
+    sensor_location_characteristic.write(_encode_sensor_location())
     
     csc_feature_characteristic.write(_encode_csc_feature())
     csc_measurement_characteristic.write(_encode_csc_measurement(0,0)) # we're not moving or pedaling to start
@@ -284,8 +320,6 @@ async def bluetooth_task():
             quickrgb(0,0,5) # we're connected, go blue
             print(dir(connection))
             await connection.disconnected()
-
-            
             
 
 async def packet_parse_task(buf, packetready_evt):
@@ -300,9 +334,13 @@ async def packet_parse_task(buf, packetready_evt):
     cal_n = 0
     
     cur_cadence = 0
-    cur_POWER = 0
+    last_power = 0 # todo part of ignoring sudden power zeroes
+    cur_power = 0
     cur_resistance = 0
     cur_resistance_normalized = 0
+    
+    last_head_message = bytearray(2)
+    last_bike_message = 0x00
     
     while True:
         await packetready_evt.wait()
@@ -317,33 +355,30 @@ async def packet_parse_task(buf, packetready_evt):
                 pass
             
             elif buf[1] == 0xF7: # bike responding with resistance cal value
-                resistance = reverse_bytes_to_int(buf[3:7])
-                print(reverse_bytes_to_int(buf[3:7]))
+                cur_resistance = reverse_bytes_to_int(buf[3:7])
             
             elif buf[1] == 0x41: # bike responding with cadence
-                pass
-                print(reverse_bytes_to_int(buf[3:6]))
+                cur_cadence = reverse_bytes_to_int(buf[3:6])
             
             elif buf[1] == 0x44: # bike responding with power
-                pass
-                print(reverse_bytes_to_int(buf[3:8]))
+                # todo ignore the last value if it's suddenly zero (need to store an extra prev value)
+                cur_power = reverse_bytes_to_int(buf[3:8])
             
             elif buf[1] == 0x4A: # bike responding with raw resistance
-                pass
-                print(reverse_bytes_to_int(buf[3:7]))
+                cur_resistance = normalize_resistance(reverse_bytes_to_int(buf[3:7]))
         
         elif buf[0] == 0xFE: # head bootup message 
             pass
         
         elif buf[0] == 0xF5: # head requests
             if buf[1] == 0x41: # head requesting cadence
-                pass
+                last_head_message = 0xF541
             
             elif buf[1] == 0x44: # head requesting output
-                pass
+                last_head_message = 0xF544
             
             elif buf[1] == 0x4A: # head requesting raw resistance
-                pass
+                last_head_message = 0xF54A
             
             else: # head requesting bike ID
                 pass
@@ -353,6 +388,8 @@ async def packet_parse_task(buf, packetready_evt):
 
         else:
             raise Exception("Unknown message", str(buf))
+        
+        power_measurement_characteristic.write(_encode_power_measurement(cur_power))
 
         packetready_evt.clear()
         await asyncio.sleep(0) # I think I might not need this line? since I start by waiting for the event
@@ -361,19 +398,17 @@ async def packet_parse_task(buf, packetready_evt):
 async def main():
     """
     create some UARTs that get handed to the serial mirror
-    maybe I'll move these to globals, since that's how they're used
     
     also making an event to control the packet parser
-    ...that should probably also be a global
-    """
+    """ # todo make some of these globals?
     buf = bytearray(20)
     head_uart = UART(1, baudrate=19200, tx=18, rx=17, timeout=5)
     bike_uart = UART(2, baudrate=19200, tx=16, rx=15, timeout=5)
     
-    packetready = asyncio.Event()
+    packet_ready_flag = asyncio.Event()
 
-    asyncio.create_task(serial_mirror_task(buf, head_uart, bike_uart, packetready))
-    asyncio.create_task(packet_parse_task(buf, packetready))
+    asyncio.create_task(serial_mirror_task(buf, head_uart, bike_uart, packet_ready_flag))
+    asyncio.create_task(packet_parse_task(buf, packet_ready_flag))
     asyncio.create_task(bluetooth_task())
     while True:
         await asyncio.sleep(0)
